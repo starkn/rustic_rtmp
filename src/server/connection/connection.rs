@@ -266,37 +266,51 @@ impl Connection {
     fn handle_audio_data(data: Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
         // Handle audio data.
         // ...
-        info!("Audio data: {:?}", data);
+		if data.len() < 65 {
+			info!("Audio data: {:?}", &data[1..data.len()]);
+		} else {
+        	info!("Audio data: {:?}", &data[1..64]);
+		}
         Ok(())
     }
 
     fn handle_video_data(data: Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
         // Handle video data.
         // ...
-        info!("Video data: {:?}", data);
+		if data.len() < 65 {
+			info!("Video data: {:?}", &data[1..data.len()]);
+		} else {
+        	info!("Video data: {:?}", &data[1..64]);
+		}
         Ok(())
     }
 
     async fn read_message(&mut self) -> Result<RtmpMessage, Box<dyn std::error::Error>> {
-        // Create a buffer to hold the message data.
-        let mut buffer = vec![0; 12288]; // Adjust the size as needed.
+		// Create a buffer to hold the message data.
+		let mut data = Vec::<u8>::new();
+		let mut buffer = [0; 1]; // Read the Basic Header
 
-        // Read data from the client into the buffer.
-        let size = self.stream.read(&mut buffer).await?;
-        // info!("Read {} bytes", size);
-        self.marker = 0;
+		// Read data from the client into the buffer.
+		let size = self.stream.read(&mut buffer).await?;
+		// info!("Read {} bytes", size);
+		self.marker = 0;
+		data.extend_from_slice(&buffer);
 
-        // Parse the data into an RtmpMessage.
-        let message = Self::parse_message(self, &buffer[0..size])?;
+		// Parse the data into an RtmpMessage.
+		let message = Self::parse_message(self, &mut data).await?;
 
-        Ok(message)
+		return Ok(message);
     }
 
-    pub fn parse_msg_header(
-        &mut self,
-        data: &[u8],
-    ) -> Result<RtmpMessage, Box<dyn std::error::Error>> {
-        if data.is_empty() {
+	async fn parse_message(&mut self, data: &mut Vec<u8>) -> Result<RtmpMessage, Box<dyn std::error::Error>> {
+        info!("Parse Message data: {:?}", data);
+
+        let msg = Connection::parse_msg_header(self, data).await?;
+        Ok(msg)
+    }
+
+    pub async fn parse_msg_header(&mut self, data: &mut Vec<u8>) -> Result<RtmpMessage, Box<dyn std::error::Error>> {
+        if data.len() < 1 {
             error!("No message to read");
             return Err("No message to read".into());
         }
@@ -305,41 +319,50 @@ impl Connection {
         let basic_header = ChunkBasicHeader::new(&data[self.marker]);
         self.marker += 1;
         info!("fmt: {}, cs: {}", basic_header.fmt, basic_header.cs);
-        let msg = Connection::read_header_types(self, data, basic_header)?;
+        let msg = Connection::read_header_types(self, data, basic_header).await?;
         Ok(msg)
     }
 
-    pub fn read_header_types(
-        &mut self,
-        data: &[u8],
-        header: ChunkBasicHeader,
-    ) -> Result<RtmpMessage, Box<dyn std::error::Error>> {
-        match ChunkFmt::from_u8(header.fmt) {
-            Some(ChunkFmt::Type0) => {
-                let read_to = self.marker + 11;
+    pub async fn read_header_types(&mut self, data: &mut Vec<u8>, header: ChunkBasicHeader) -> Result<RtmpMessage, Box<dyn std::error::Error>> {
+        match ChunkFmt::from_u8(header.fmt) 
+        {
+            Some(ChunkFmt::Type0) => 
+            {
+				let mut buffer = [0; 11];
+				let size = self.stream.read(&mut buffer).await?;
+				data.extend_from_slice(&buffer);
+				let read_to = data.len();
                 let chunk_message_header = ChunkMessageHeader::type0(&data[self.marker..read_to]);
                 self.marker = read_to;
-                let msg = Connection::read_msg_type(self, data, chunk_message_header);
-                return msg;
+                let msg = Connection::read_msg_type(self, data, chunk_message_header).await?;
+                return Ok(msg);
             }
-            Some(ChunkFmt::Type1) => {
-                let read_to = self.marker + 7;
+            Some(ChunkFmt::Type1) => 
+            {
+				let mut buffer = [0; 7];
+				let size = self.stream.read(&mut buffer).await?;
+				data.extend_from_slice(&buffer);
+				let read_to = data.len();
                 let chunk_message_header = ChunkMessageHeader::type1(&data[self.marker..read_to]);
                 self.marker = read_to;
-                let msg = Connection::read_msg_type(self, data, chunk_message_header);
-                return msg;
+                let msg = Connection::read_msg_type(self, data, chunk_message_header).await?;
+                return Ok(msg);
             }
-            Some(ChunkFmt::Type2) => {
-                let read_to = self.marker + 3;
+            Some(ChunkFmt::Type2) => 
+            {
+				let mut buffer = [0; 3];
+				let size = self.stream.read(&mut buffer).await?;
+				data.extend_from_slice(&buffer);
+				let read_to = data.len();
                 let chunk_message_header = ChunkMessageHeader::type2(&data[self.marker..read_to]);
                 self.marker = read_to;
-                let msg = Connection::read_msg_type(self, data, chunk_message_header);
-                return msg;
+                let msg = Connection::read_msg_type(self, data, chunk_message_header).await?;
+                return Ok(msg);
             }
             Some(ChunkFmt::Type3) => {
                 let chunk_message_header = ChunkMessageHeader::type3();
-                let msg = Connection::read_msg_type(self, data, chunk_message_header);
-                return msg;
+                let msg = Connection::read_msg_type(self, data, chunk_message_header).await?;
+                return Ok(msg);
             }
             _ => {
                 info!("Unknown chunk format");
@@ -349,15 +372,14 @@ impl Connection {
         Err("Unknown chunk format".into())
     }
 
-    pub fn read_msg_type(
-        &mut self,
-        data: &[u8],
-        msg_header: ChunkMessageHeader,
-    ) -> Result<RtmpMessage, Box<dyn std::error::Error>> {
+    pub async fn read_msg_type(&mut self, data: &mut Vec<u8>, msg_header: ChunkMessageHeader) -> Result<RtmpMessage, Box<dyn std::error::Error>> {
         match msg_header.message_type_id {
             Some(msg_type_id::SET_CHUNK_SIZE) => {
                 info!("Message type: Set Chunk Size");
-                let read_to = self.marker + 4;
+				let mut buffer = [0; 4];
+				let size = self.stream.read(&mut buffer).await?;
+				data.extend_from_slice(&buffer);
+				let read_to = data.len();
                 let chunk_size = Self::read_set_chunk(&data[self.marker..read_to])?;
                 info!("chunk_size: {}", chunk_size);
                 self.marker = read_to;
@@ -369,7 +391,10 @@ impl Connection {
             }
             Some(msg_type_id::ACKNOWLEDGEMENT) => {
                 info!("Message type: Acknowledgement");
-                let read_to = self.marker + 4;
+				let mut buffer = [0; 4];
+				let size = self.stream.read(&mut buffer).await?;
+				data.extend_from_slice(&buffer);
+				let read_to = data.len();
                 let ack_sequence_number = Self::read_ack(&data[self.marker..read_to])?;
                 self.marker = read_to;
                 let ack = AcknowledgementMessage::new(ack_sequence_number);
@@ -387,21 +412,23 @@ impl Connection {
             }
             Some(msg_type_id::AUDIO) => {
                 info!("Message type: Audio");
-                let read_to = self.marker + msg_header.message_length.unwrap() as usize;
-                let audio_data = AudioData::new(
-                    msg_header.message_stream_id.unwrap(),
-                    data[self.marker..read_to].to_vec(),
-                );
+                let msg_size = msg_header.message_length.unwrap() as usize;
+				let mut buffer = vec![0; msg_size];
+				let size = self.stream.read_exact(&mut buffer).await?;
+				data.extend_from_slice(&buffer);
+				let read_to = data.len();
+                let audio_data = AudioData::new(msg_header.message_stream_id.unwrap(), data[self.marker..read_to].to_vec());
                 self.marker = read_to;
                 return Ok(RtmpMessage::AudioData(audio_data));
             }
             Some(msg_type_id::VIDEO) => {
                 info!("Message type: Video");
-                let read_to = self.marker + msg_header.message_length.unwrap() as usize;
-                let video_data = VideoData::new(
-                    msg_header.message_stream_id.unwrap(),
-                    data[self.marker..read_to].to_vec(),
-                );
+                let msg_size = msg_header.message_length.unwrap() as usize;
+				let mut buffer = vec![0; msg_size];
+				let size = self.stream.read_exact(&mut buffer).await?;
+				data.extend_from_slice(&buffer);
+				let read_to = data.len();
+                let video_data = VideoData::new(msg_header.message_stream_id.unwrap(), data[self.marker..read_to].to_vec());
                 self.marker = read_to;
                 return Ok(RtmpMessage::VideoData(video_data));
             }
@@ -417,7 +444,10 @@ impl Connection {
             Some(msg_type_id::DATA_AMF0) => {
                 info!("Message type: Data AMF0");
                 if let Some(msg_len) = msg_header.message_length {
-                    let read_to = self.marker + msg_len as usize;
+					let mut buffer = vec![0; msg_len as usize];
+					let size = self.stream.read_exact(&mut buffer).await?;
+					data.extend_from_slice(&buffer);
+					let read_to = data.len();
                     let msg_name = BasicCommand::parse(&data[self.marker..read_to])?.command_name;
                     info!("msg_name: {:?}", msg_name);
                     match msg_name.as_str() {
@@ -443,9 +473,11 @@ impl Connection {
             Some(msg_type_id::COMMAND_AMF0) => {
                 info!("Message type: Command AMF0");
                 if let Some(msg_len) = msg_header.message_length {
-                    let read_to = self.marker + msg_len as usize;
-                    let command_name =
-                        BasicCommand::parse(&data[self.marker..read_to])?.command_name;
+					let mut buffer = vec![0; msg_len as usize];
+					let size = self.stream.read_exact(&mut buffer).await?;
+					data.extend_from_slice(&buffer);
+					let read_to = data.len();
+                    let command_name = BasicCommand::parse(&data[self.marker..read_to])?.command_name;
                     info!("command_name: {:?}", command_name);
                     match command_name.as_str() {
                         "connect" => {
@@ -524,21 +556,6 @@ impl Connection {
         }
         error!("Unknown message type");
         Err("Unknown message type".into())
-    }
-
-    fn parse_message(&mut self, data: &[u8]) -> Result<RtmpMessage, Box<dyn std::error::Error>> {
-        info!("Parse Message data: {:?}", data);
-
-        let msg = Connection::parse_msg_header(self, data)?;
-
-        // check for more msg types
-        if self.marker < data.len() && &data[self.marker] != &0 {
-            warn!("more msg types");
-            let message = Self::parse_message(self, data)?;
-            return Ok(message);
-        }
-
-        Ok(msg)
     }
 
     fn read_set_chunk(data: &[u8]) -> Result<u32, Box<dyn std::error::Error>> {
