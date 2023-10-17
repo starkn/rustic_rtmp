@@ -741,11 +741,11 @@ impl AcknowledgementMessage {
 
 #[derive(Debug)]
 pub struct SetChunkSizeMessage {
-    pub chunk_size: u32,
+    pub chunk_size: usize,
 }
 
 impl SetChunkSizeMessage {
-    pub fn new(chunk_size: u32) -> SetChunkSizeMessage {
+    pub fn new(chunk_size: usize) -> SetChunkSizeMessage {
         SetChunkSizeMessage {
             chunk_size,
         }

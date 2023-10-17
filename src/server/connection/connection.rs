@@ -17,12 +17,15 @@ pub const SET_BANDWIDTH_SIZE: u32 = 4096;
 pub struct Connection {
     stream: TcpStream,
     marker: usize,
+    cur_chunk: ChunkMessageHeader,  // The current chunk header, for all message types 1-3
+    chunk_size: usize,
+    prev_length: u32    // The most recent sent message length, for use in message type2
 }
 
 #[warn(unreachable_code)]
 impl Connection {
     pub fn new(stream: TcpStream) -> Connection {
-        Connection { stream, marker: 0 }
+        Connection { stream, marker: 0, cur_chunk: ChunkMessageHeader::default(), chunk_size: 0, prev_length: 0 }
     }
 
     pub async fn handle(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -41,6 +44,9 @@ impl Connection {
                 }
                 RtmpMessage::CreateStream(create_stream_message) => {
                     self.handle_create_stream(create_stream_message).await?;
+                }
+                RtmpMessage::SetChunkSize(set_chunk_size_message) => {
+                    self.chunk_size = set_chunk_size_message.chunk_size;
                 }
                 RtmpMessage::_Play(play_message) => {
                     self.handle_play(play_message).await?;
@@ -287,11 +293,11 @@ impl Connection {
 
     async fn read_message(&mut self) -> Result<RtmpMessage, Box<dyn std::error::Error>> {
 		// Create a buffer to hold the message data.
-		let mut data = Vec::<u8>::new();
+		let mut data = Vec::<u8>::with_capacity(self.chunk_size + 128);
 		let mut buffer = [0; 1]; // Read the Basic Header
 
 		// Read data from the client into the buffer.
-		let size = self.stream.read(&mut buffer).await?;
+		self.stream.read(&mut buffer).await?;
 		// info!("Read {} bytes", size);
 		self.marker = 0;
 		data.extend_from_slice(&buffer);
@@ -329,39 +335,50 @@ impl Connection {
             Some(ChunkFmt::Type0) => 
             {
 				let mut buffer = [0; 11];
-				let size = self.stream.read(&mut buffer).await?;
+				self.stream.read(&mut buffer).await?;
 				data.extend_from_slice(&buffer);
 				let read_to = data.len();
                 let chunk_message_header = ChunkMessageHeader::type0(&data[self.marker..read_to]);
                 self.marker = read_to;
-                let msg = Connection::read_msg_type(self, data, chunk_message_header).await?;
+                self.prev_length = chunk_message_header.message_length.unwrap();
+                self.cur_chunk = chunk_message_header;
+                let msg = Connection::read_msg_type(self, data).await?;
                 return Ok(msg);
             }
             Some(ChunkFmt::Type1) => 
             {
 				let mut buffer = [0; 7];
-				let size = self.stream.read(&mut buffer).await?;
+				self.stream.read(&mut buffer).await?;
 				data.extend_from_slice(&buffer);
 				let read_to = data.len();
                 let chunk_message_header = ChunkMessageHeader::type1(&data[self.marker..read_to]);
                 self.marker = read_to;
-                let msg = Connection::read_msg_type(self, data, chunk_message_header).await?;
+                self.cur_chunk.timestamp_delta = chunk_message_header.timestamp_delta;
+                self.cur_chunk.message_length = chunk_message_header.message_length;
+                self.cur_chunk.message_type_id = chunk_message_header.message_type_id;
+                self.prev_length = chunk_message_header.message_length.unwrap();
+                let msg = Connection::read_msg_type(self, data).await?;
                 return Ok(msg);
             }
             Some(ChunkFmt::Type2) => 
             {
 				let mut buffer = [0; 3];
-				let size = self.stream.read(&mut buffer).await?;
+				self.stream.read(&mut buffer).await?;
 				data.extend_from_slice(&buffer);
 				let read_to = data.len();
                 let chunk_message_header = ChunkMessageHeader::type2(&data[self.marker..read_to]);
                 self.marker = read_to;
-                let msg = Connection::read_msg_type(self, data, chunk_message_header).await?;
+                self.cur_chunk.timestamp_delta = chunk_message_header.timestamp_delta;
+                self.cur_chunk.message_length = Some(self.prev_length);
+                let msg = Connection::read_msg_type(self, data).await?;
                 return Ok(msg);
             }
             Some(ChunkFmt::Type3) => {
-                let chunk_message_header = ChunkMessageHeader::type3();
-                let msg = Connection::read_msg_type(self, data, chunk_message_header).await?;
+                let msg = Connection::read_msg_type(self, data).await?;
+                info!("timestamp: {}", self.cur_chunk.timestamp.unwrap());
+                info!("message_length: {}", self.cur_chunk.message_length.unwrap());
+                info!("message_type_id: {}", self.cur_chunk.message_type_id.unwrap());
+                info!("message_stream_id: {}", self.cur_chunk.message_stream_id.unwrap());
                 return Ok(msg);
             }
             _ => {
@@ -372,15 +389,15 @@ impl Connection {
         Err("Unknown chunk format".into())
     }
 
-    pub async fn read_msg_type(&mut self, data: &mut Vec<u8>, msg_header: ChunkMessageHeader) -> Result<RtmpMessage, Box<dyn std::error::Error>> {
-        match msg_header.message_type_id {
+    pub async fn read_msg_type(&mut self, data: &mut Vec<u8>) -> Result<RtmpMessage, Box<dyn std::error::Error>> {
+        match self.cur_chunk.message_type_id {
             Some(msg_type_id::SET_CHUNK_SIZE) => {
                 info!("Message type: Set Chunk Size");
 				let mut buffer = [0; 4];
-				let size = self.stream.read(&mut buffer).await?;
+				self.stream.read(&mut buffer).await?;
 				data.extend_from_slice(&buffer);
 				let read_to = data.len();
-                let chunk_size = Self::read_set_chunk(&data[self.marker..read_to])?;
+                let chunk_size = Self::read_set_chunk(&data[self.marker..read_to])? as usize;
                 info!("chunk_size: {}", chunk_size);
                 self.marker = read_to;
                 let set_chunk_size = SetChunkSizeMessage::new(chunk_size);
@@ -392,7 +409,7 @@ impl Connection {
             Some(msg_type_id::ACKNOWLEDGEMENT) => {
                 info!("Message type: Acknowledgement");
 				let mut buffer = [0; 4];
-				let size = self.stream.read(&mut buffer).await?;
+				self.stream.read(&mut buffer).await?;
 				data.extend_from_slice(&buffer);
 				let read_to = data.len();
                 let ack_sequence_number = Self::read_ack(&data[self.marker..read_to])?;
@@ -412,24 +429,26 @@ impl Connection {
             }
             Some(msg_type_id::AUDIO) => {
                 info!("Message type: Audio");
-                let msg_size = msg_header.message_length.unwrap() as usize;
-				let mut buffer = vec![0; msg_size];
-				let size = self.stream.read_exact(&mut buffer).await?;
+                let msg_size = std::cmp::min(self.cur_chunk.message_length.unwrap() as usize, self.chunk_size);
+                let mut buffer = vec![0; msg_size];
+				self.stream.read_exact(&mut buffer).await?;
 				data.extend_from_slice(&buffer);
 				let read_to = data.len();
-                let audio_data = AudioData::new(msg_header.message_stream_id.unwrap(), data[self.marker..read_to].to_vec());
+                let audio_data = AudioData::new(self.cur_chunk.message_stream_id.unwrap(), data[self.marker..read_to].to_vec());
                 self.marker = read_to;
+                self.cur_chunk.message_length = Some(self.cur_chunk.message_length.unwrap() - msg_size as u32);
                 return Ok(RtmpMessage::AudioData(audio_data));
             }
             Some(msg_type_id::VIDEO) => {
                 info!("Message type: Video");
-                let msg_size = msg_header.message_length.unwrap() as usize;
+                let msg_size = std::cmp::min(self.cur_chunk.message_length.unwrap() as usize, self.chunk_size);
 				let mut buffer = vec![0; msg_size];
-				let size = self.stream.read_exact(&mut buffer).await?;
+				self.stream.read_exact(&mut buffer).await?;
 				data.extend_from_slice(&buffer);
 				let read_to = data.len();
-                let video_data = VideoData::new(msg_header.message_stream_id.unwrap(), data[self.marker..read_to].to_vec());
+                let video_data = VideoData::new(self.cur_chunk.message_stream_id.unwrap(), data[self.marker..read_to].to_vec());
                 self.marker = read_to;
+                self.cur_chunk.message_length = Some(self.cur_chunk.message_length.unwrap() - msg_size as u32);
                 return Ok(RtmpMessage::VideoData(video_data));
             }
             Some(msg_type_id::COMMAND_AMF3) => {
@@ -443,9 +462,9 @@ impl Connection {
             }
             Some(msg_type_id::DATA_AMF0) => {
                 info!("Message type: Data AMF0");
-                if let Some(msg_len) = msg_header.message_length {
+                if let Some(msg_len) = self.cur_chunk.message_length {
 					let mut buffer = vec![0; msg_len as usize];
-					let size = self.stream.read_exact(&mut buffer).await?;
+					self.stream.read_exact(&mut buffer).await?;
 					data.extend_from_slice(&buffer);
 					let read_to = data.len();
                     let msg_name = BasicCommand::parse(&data[self.marker..read_to])?.command_name;
@@ -472,9 +491,9 @@ impl Connection {
             }
             Some(msg_type_id::COMMAND_AMF0) => {
                 info!("Message type: Command AMF0");
-                if let Some(msg_len) = msg_header.message_length {
+                if let Some(msg_len) = self.cur_chunk.message_length {
 					let mut buffer = vec![0; msg_len as usize];
-					let size = self.stream.read_exact(&mut buffer).await?;
+					self.stream.read_exact(&mut buffer).await?;
 					data.extend_from_slice(&buffer);
 					let read_to = data.len();
                     let command_name = BasicCommand::parse(&data[self.marker..read_to])?.command_name;
@@ -550,7 +569,7 @@ impl Connection {
                 }
             }
             _ => {
-                error!("Message type: Unknown");
+                error!("Message type: Unknown {:?}", self.cur_chunk.message_type_id);
                 return Err("Unknown message type".into());
             }
         }
